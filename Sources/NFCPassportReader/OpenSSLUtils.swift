@@ -144,62 +144,68 @@ public class OpenSSLUtils {
     /// - Parameter x509Cert: The X509 certificate (in PEM format) to verify
     /// - Parameter CAFile: The URL path of a file containing the list of certificates used to try to discover and build a trust chain
     /// - Returns: either the X509 issue signing certificate that was used to sign the passed in X509 certificate or an error
-    static func verifyTrustAndGetIssuerCertificate( x509 : X509Wrapper, CAFile : URL ) -> Result<X509Wrapper, OpenSSLError> {
-                
-        guard let cert_ctx = X509_STORE_new() else { return .failure(OpenSSLError.UnableToVerifyX509CertificateForSOD("Unable to create certificate store")) }
-        defer { X509_STORE_free(cert_ctx) }
-        
-        X509_STORE_set_verify_cb(cert_ctx) { (ok, ctx) -> Int32 in
-            let cert_error = X509_STORE_CTX_get_error(ctx)
-            
-            if ok == 0 {
-                let errVal = X509_verify_cert_error_string(Int(cert_error))
-                let val = errVal!.withMemoryRebound(to: CChar.self, capacity: 1000) { (ptr) in
-                    return String(cString: ptr)
-                }
-                
-                Logger.openSSL.error("error \(cert_error) at \(X509_STORE_CTX_get_error_depth(ctx)) depth lookup:\(val)" )
-            }
-            
-            return ok;
+    static func verifyTrustAndGetIssuerCertificate(x509: X509Wrapper, CAFile: URL) -> Result<X509Wrapper, OpenSSLError> {
+
+        // Step 1: Create a new X509_STORE for trusted certificates
+        guard let certStore = X509_STORE_new() else {
+            return .failure(OpenSSLError.UnableToVerifyX509CertificateForSOD("Unable to create certificate store"))
         }
-        
-        guard let lookup = X509_STORE_add_lookup(cert_ctx, X509_LOOKUP_file()) else { return .failure(OpenSSLError.UnableToVerifyX509CertificateForSOD("Unable to add lookup to store")) }
-        
-        // Load masterList.pem file
-        var rc = X509_LOOKUP_ctrl(lookup, X509_L_FILE_LOAD, CAFile.path, Int(X509_FILETYPE_PEM), nil)
-        
-        guard let store = X509_STORE_CTX_new() else {
-            return .failure(OpenSSLError.UnableToVerifyX509CertificateForSOD("Unable to create new X509_STORE_CTX"))
-        }
-        defer { X509_STORE_CTX_free(store) }
-        
-        X509_STORE_set_flags(cert_ctx, 0)
-        rc = X509_STORE_CTX_init(store, cert_ctx, x509.cert, nil)
-        if rc == 0 {
-            return .failure(OpenSSLError.UnableToVerifyX509CertificateForSOD("Unable to initialise X509_STORE_CTX"))
+        defer { X509_STORE_free(certStore) }
+
+        // Step 2: Load the CAFile (masterList.pem)
+        guard let lookup = X509_STORE_add_lookup(certStore, X509_LOOKUP_file()) else {
+            return .failure(OpenSSLError.UnableToVerifyX509CertificateForSOD("Unable to add lookup to certificate store"))
         }
 
-        // discover and verify X509 certificte chain
-        let i = X509_verify_cert(store);
-        if i != 1 {
-            let err = X509_STORE_CTX_get_error(store)
-            
-            return .failure(OpenSSLError.UnableToVerifyX509CertificateForSOD("Verification of certificate failed - errorCode \(err)"))
+        let loadResult = X509_LOOKUP_ctrl(lookup, X509_L_FILE_LOAD, CAFile.path, Int(X509_FILETYPE_PEM), nil)
+        if loadResult != 1 {
+            return .failure(OpenSSLError.UnableToVerifyX509CertificateForSOD("Failed to load certificates from CA file at \(CAFile.path)"))
         }
-        
-        // Get chain and issue certificate is the last cert in the chain
-        let chain = X509_STORE_CTX_get1_chain(store);
-        let nrCertsInChain = sk_X509_num(chain)
-        if nrCertsInChain > 1 {
-            let cert = sk_X509_value(chain, nrCertsInChain-1)
-            if let certWrapper = X509Wrapper(with: cert) {
-                return .success( certWrapper )
+
+        // Optional: Set verification flags if needed (adjust as necessary for your use case)
+        X509_STORE_set_flags(certStore, 0)
+
+        // Step 3: Create a new X509_STORE_CTX for the verification context
+        guard let storeCtx = X509_STORE_CTX_new() else {
+            return .failure(OpenSSLError.UnableToVerifyX509CertificateForSOD("Unable to create X509_STORE_CTX"))
+        }
+        defer { X509_STORE_CTX_free(storeCtx) }
+
+        // Initialize the context with the certificate to be verified and the trust store
+        let initResult = X509_STORE_CTX_init(storeCtx, certStore, x509.cert, nil)
+        if initResult == 0 {
+            return .failure(OpenSSLError.UnableToVerifyX509CertificateForSOD("Failed to initialize X509_STORE_CTX"))
+        }
+
+        // Step 4: Perform certificate verification
+        let verifyResult = X509_verify_cert(storeCtx)
+        if verifyResult != 1 {
+            let errorCode = X509_STORE_CTX_get_error(storeCtx)
+            return .failure(OpenSSLError.UnableToVerifyX509CertificateForSOD("Certificate verification failed with error code \(errorCode): \(String(cString: X509_verify_cert_error_string(Int(errorCode))))"))
+        }
+
+        // Step 5: Retrieve the verified certificate chain
+        guard let chain = X509_STORE_CTX_get1_chain(storeCtx) else {
+            return .failure(OpenSSLError.UnableToVerifyX509CertificateForSOD("Unable to retrieve certificate chain"))
+        }
+        defer { sk_X509_pop_free(chain, X509_free) }
+
+        let chainCount = sk_X509_num(chain)
+        if chainCount > 1 {
+            // Get the issuer certificate (last in the chain)
+            guard let issuerCert = sk_X509_value(chain, chainCount - 1) else {
+                return .failure(OpenSSLError.UnableToVerifyX509CertificateForSOD("Issuer certificate not found in chain"))
+            }
+
+            // Wrap the issuer certificate in X509Wrapper
+            if let certWrapper = X509Wrapper(with: issuerCert) {
+                return .success(certWrapper)
             }
         }
-        
-        return .failure(OpenSSLError.UnableToVerifyX509CertificateForSOD("Unable to get issuer certificate - not found"))
+
+        return .failure(OpenSSLError.UnableToVerifyX509CertificateForSOD("Unable to retrieve issuer certificate"))
     }
+
     
     
     /// Verifies the signed data section against the stored certificate and extracts the signed data section from a PKCS7 container (if present and valid)
